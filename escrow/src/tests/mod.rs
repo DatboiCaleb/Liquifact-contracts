@@ -22,7 +22,8 @@ use super::{
     DeprecatedTransferAdminUsed, EscrowError, EscrowFunded, EscrowInitialized, EscrowUnfunded,
     FundingCancelled, FundingDeadlineExtensionStats, FundingTargetUpdated, InvestorFreezeChanged,
     InvestorRefundedEvt, LiquifactEscrow, LiquifactEscrowClient, MaturityMaxHorizonUpdated,
-    MaxUniqueInvestorsCapLowered, PauseReason, PauseScope, PauseState, PrimaryAttestationBound,
+    MaxUniqueInvestorsCapLowered, PauseReason, PauseScope, PauseState, PerformanceFeeCollected,
+    PerformanceFeeUpdated, PrimaryAttestationBound,
     RegistryRefRebound, SettleBatchProcessed, TreasuryDustSwept, UpgradeCancelled, UpgradeProposed,
     YieldTier, MAX_ATTESTATION_APPEND_ENTRIES, MAX_DUST_SWEEP_AMOUNT,
     MAX_FUNDING_DEADLINE_EXTENSIONS, MAX_FUNDING_DEADLINE_TOTAL_EXTENSION_SECS, MAX_FUND_BATCH,
@@ -77,6 +78,7 @@ mod init;
 // API (close-escrow, admin-transfer, collateral events) and an older SDK event
 // model that no longer exist, and is superseded by the active modules below.
 // mod integration;
+mod fees;
 mod funding_deadline_cap_tests;
 mod integration_status_guards;
 mod investor_freeze;

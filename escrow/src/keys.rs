@@ -130,3 +130,8 @@ pub(crate) fn investor_indexed(investor: Address) -> DataKey {
 pub(crate) fn investor_refunded(investor: Address) -> DataKey {
     DataKey::InvestorRefunded(investor)
 }
+
+/// Instance-storage optional performance fee in basis points taken from investor yield coupon.
+pub(crate) fn performance_fee_bps() -> DataKey {
+    DataKey::PerformanceFeeBps
+}
