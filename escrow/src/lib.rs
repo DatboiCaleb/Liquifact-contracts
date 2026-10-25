@@ -1054,6 +1054,17 @@ pub enum EscrowError {
     /// real investors' pro-rata share (issue #1547). Checked before `require_auth` and
     /// before any storage write; `fund_batch` inherits the check atomically via `fund_impl`.
     InvestorRoleConflict = 296,
+    /// [`LiquifactEscrow::set_investor_frozen`] was called but the requested freeze state
+    /// (`frozen`) is identical to the currently stored state. No-op changes are rejected to
+    /// prevent spurious events and unnecessary storage writes.
+    InvestorFreezeUnchanged = 297,
+
+    /// An investor whose [`DataKey::InvestorFrozen`] flag is `true` attempted to call
+    /// [`LiquifactEscrow::fund`], [`LiquifactEscrow::unfund`],
+    /// [`LiquifactEscrow::claim_investor_payout`], or [`LiquifactEscrow::refund`].
+    /// The operation is blocked until the admin clears the freeze via
+    /// [`LiquifactEscrow::set_investor_frozen`].
+    InvestorFrozen = 298,
 }
 
 #[inline(always)]
@@ -1184,6 +1195,30 @@ pub(crate) fn guard_not_paused(env: &Env, error: EscrowError, entry: PauseEntry)
 #[inline(always)]
 pub(crate) fn guard_not_legal_hold(env: &Env, error: EscrowError) {
     ensure(env, !LiquifactEscrow::legal_hold_active(env), error);
+}
+
+/// Read-only precondition: assert that this specific investor is **not** frozen.
+///
+/// Checks [`DataKey::InvestorFrozen`] in persistent storage.  Absent ⇒ treated as
+/// not-frozen (additive-key semantics per ADR-007), so the guard is always a no-op
+/// on pre-existing investor positions.
+///
+/// # Errors
+/// Panics with [`EscrowError::InvestorFrozen`] when the stored `frozen` flag is `true`.
+///
+/// # Security notes
+/// - Read-only: one persistent-storage read with `unwrap_or`. No writes.
+/// - Not an authorization check; callers must still call `require_auth()` for
+///   their bound role.
+/// - Independent of [`DataKey::LegalHold`] and [`DataKey::Paused`]; compose as needed.
+#[inline(always)]
+pub(crate) fn guard_investor_not_frozen(env: &Env, investor: &Address) {
+    let (frozen, _reason): (bool, u32) = env
+        .storage()
+        .persistent()
+        .get(&DataKey::InvestorFrozen(investor.clone()))
+        .unwrap_or((false, 0u32));
+    ensure(env, !frozen, EscrowError::InvestorFrozen);
 }
 
 /// Predicate: `true` when `status` is one of the **terminal** escrow states
@@ -1536,6 +1571,13 @@ pub enum DataKey {
     /// first used this reference.  Written once; absent ⇒ the reference is available.
     /// Additive key (ADR-007): absence returns `None` for `get_reference_owner`.
     ContributionReference(BytesN<32>),
+    /// Per-investor compliance freeze status `(frozen: bool, reason_code: u32)`.
+    /// **Persistent** storage. Absent ⇒ `(false, 0)` (not frozen).
+    /// Written by [`LiquifactEscrow::set_investor_frozen`]; read by the freeze guard and
+    /// [`LiquifactEscrow::get_investor_freeze`].
+    /// **Additive key (ADR-007):** appended at the end of the enum; absence is treated as
+    /// not-frozen, preserving existing behaviour for all pre-existing investor positions.
+    InvestorFrozen(Address),
 }
 
 // --- Data types ---
@@ -2525,6 +2567,24 @@ pub struct RefundBatchProcessed {
     pub invoice_id: Symbol,
     pub count: u32,
     pub total: i128,
+}
+
+/// Emitted by [`LiquifactEscrow::set_investor_frozen`] whenever an investor's freeze
+/// status changes (frozen or unfrozen).
+///
+/// `frozen` is `1` when the investor is being frozen, `0` when unfrozen.
+/// `reason_code` is the caller-supplied compliance code (e.g. sanction list id).
+#[contractevent]
+pub struct InvestorFreezeChanged {
+    #[topic]
+    pub name: Symbol,
+    #[topic]
+    pub investor: Address,
+    #[topic]
+    pub invoice_id: Symbol,
+    /// `1` = frozen, `0` = unfrozen.
+    pub frozen: u32,
+    pub reason_code: u32,
 }
 
 /// Emitted after a successful [`LiquifactEscrow::unfund`] call.
@@ -4428,6 +4488,7 @@ impl LiquifactEscrow {
             DataKey::InvestorClaimNotBefore(investor.clone()),
             DataKey::InvestorClaimed(investor.clone()),
             DataKey::InvestorAllowlisted(investor.clone()),
+            DataKey::InvestorFrozen(investor.clone()),
         ];
 
         for key in keys_to_check.iter() {
@@ -6164,6 +6225,83 @@ impl LiquifactEscrow {
             .unwrap_or(false)
     }
 
+    /// Freeze or unfreeze a single investor position for compliance purposes.
+    ///
+    /// When frozen, the investor cannot call [`LiquifactEscrow::fund`],
+    /// [`LiquifactEscrow::unfund`], [`LiquifactEscrow::claim_investor_payout`], or
+    /// [`LiquifactEscrow::refund`] until the admin calls this function with `frozen = false`.
+    /// A frozen investor is **silently skipped** in [`LiquifactEscrow::refund_batch`] so
+    /// the batch is not blocked by a single sanctioned address.
+    ///
+    /// No-op changes (setting the same `frozen` value that is already stored) are rejected
+    /// with [`EscrowError::InvestorFreezeUnchanged`] to prevent spurious events.
+    ///
+    /// The TTL of the [`DataKey::InvestorFrozen`] key is extended on every successful write.
+    ///
+    /// # Parameters
+    /// - `investor`: The address whose freeze status is being changed.
+    /// - `frozen`: `true` to freeze, `false` to unfreeze.
+    /// - `reason_code`: Caller-supplied compliance code (e.g. a sanction list id). Pass `0` for
+    ///   no specific code.
+    ///
+    /// # Errors
+    /// - [`EscrowError::EscrowNotInitialized`] if the contract has not been initialised.
+    /// - [`EscrowError::Unauthorized`] if the caller is not the admin.
+    /// - [`EscrowError::InvestorFreezeUnchanged`] if `frozen` equals the currently stored value.
+    ///
+    /// # Events
+    /// Emits [`InvestorFreezeChanged`] on success.
+    pub fn set_investor_frozen(env: Env, investor: Address, frozen: bool, reason_code: u32) {
+        let escrow = Self::load_escrow_require_admin(&env);
+
+        let (current_frozen, _): (bool, u32) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InvestorFrozen(investor.clone()))
+            .unwrap_or((false, 0u32));
+
+        ensure(
+            &env,
+            current_frozen != frozen,
+            EscrowError::InvestorFreezeUnchanged,
+        );
+
+        let ttl = Self::get_storage_limit(env.clone());
+        env.storage().persistent().set(
+            &DataKey::InvestorFrozen(investor.clone()),
+            &(frozen, reason_code),
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::InvestorFrozen(investor.clone()), ttl, ttl);
+
+        InvestorFreezeChanged {
+            name: symbol_short!("inv_frz"),
+            investor,
+            invoice_id: escrow.invoice_id.clone(),
+            frozen: if frozen { 1 } else { 0 },
+            reason_code,
+        }
+        .publish(&env);
+    }
+
+    /// Returns the freeze status `(frozen: bool, reason_code: u32)` for an investor.
+    ///
+    /// Reads [`DataKey::InvestorFrozen`] from persistent storage.
+    /// Absent ⇒ `(false, 0)` (not frozen), preserving additive-key semantics (ADR-007).
+    ///
+    /// # Parameters
+    /// - `investor`: The address to query.
+    ///
+    /// # Returns
+    /// `(frozen, reason_code)` tuple.
+    pub fn get_investor_freeze(env: Env, investor: Address) -> (bool, u32) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InvestorFrozen(investor))
+            .unwrap_or((false, 0u32))
+    }
+
     /// Returns a paginated list of allowlisted investor addresses.
     ///
     /// Reads the allowlist index and filters by live `InvestorAllowlisted` status
@@ -7238,6 +7376,8 @@ impl LiquifactEscrow {
         // status and yield_bps regardless, and hoisting the hold check before the escrow read
         // would not reduce storage operations (both keys are always read on this path).
         guard_not_legal_hold(&env, EscrowError::LegalHoldBlocksFunding);
+        // Per-investor freeze check: blocks this specific investor without affecting others.
+        guard_investor_not_frozen(&env, &investor);
         require_funding_open(&env, escrow.status);
 
         // Check funding deadline
@@ -8149,6 +8289,8 @@ impl LiquifactEscrow {
             PauseEntry::Claims,
         );
         guard_not_legal_hold(&env, EscrowError::LegalHoldBlocksInvestorClaims);
+        // Per-investor freeze check: blocks this specific investor without affecting others.
+        guard_investor_not_frozen(&env, &investor);
 
         investor.require_auth();
 
@@ -9473,6 +9615,9 @@ impl LiquifactEscrow {
     /// refundable contribution, initialized token data is missing, or the refund transfer fails
     /// token-balance invariants.
     pub fn refund(env: Env, investor: Address) {
+        // Per-investor freeze check: a frozen investor cannot refund in a cancelled escrow.
+        guard_investor_not_frozen(&env, &investor);
+
         investor.require_auth();
         Self::refund_core(&env, investor, false);
     }
@@ -9486,6 +9631,19 @@ impl LiquifactEscrow {
         // any legacy instance entry (issue #1541).
         if skip_ineligible && Self::investor_refunded(env, investor.clone()) {
             return 0;
+        }
+
+        // Skip frozen investors in batch mode without reverting the whole batch (issue #1551).
+        // A frozen investor's funds remain in the escrow until the admin unfreezes them.
+        if skip_ineligible {
+            let (investor_frozen, _): (bool, u32) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::InvestorFrozen(investor.clone()))
+                .unwrap_or((false, 0u32));
+            if investor_frozen {
+                return 0;
+            }
         }
 
         let escrow = Self::get_escrow(env.clone());
@@ -9635,6 +9793,9 @@ impl LiquifactEscrow {
             !Self::legal_hold_active(&env),
             EscrowError::UnfundLegalHoldActive,
         );
+
+        // 2b. Per-investor freeze check (read-only; checked before auth to fail fast).
+        guard_investor_not_frozen(&env, &investor);
 
         // 3. Investor auth.
         investor.require_auth();
