@@ -95,6 +95,7 @@ mod properties;
 mod reconciliation_lifecycle;
 mod refund_batch;
 mod repayment;
+mod role_separation;
 mod settle_batch_results;
 mod settlement;
 mod settlement_config_view;
