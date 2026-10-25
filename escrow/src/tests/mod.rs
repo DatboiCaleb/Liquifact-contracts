@@ -81,6 +81,7 @@ mod funding_deadline_cap_tests;
 mod integration_status_guards;
 mod investor_freeze;
 mod legal_hold;
+mod legal_hold_state_machine;
 mod maturity_horizon;
 mod migration_errors;
 mod paginated_views;
