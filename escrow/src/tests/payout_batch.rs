@@ -3,7 +3,7 @@ use crate::{EscrowError, LiquifactEscrowClient};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger as _},
-    Address, Env, String, Symbol, Vec as SorobanVec,
+    Address, Env, Event, String, Symbol, Vec as SorobanVec,
 };
 
 fn settled_escrow<'a>(
@@ -66,21 +66,27 @@ fn settled_escrow<'a>(
     (client, token, contract_id, investors)
 }
 
-fn claim_event_count(env: &Env) -> u32 {
-    env.events()
-        .all()
-        .events()
+/// Number of `InvestorPayoutClaimed` events emitted by the **last** contract invocation
+/// for the given investors (soroban-sdk test events only cover the last invocation).
+fn claim_event_count(
+    env: &Env,
+    client: &LiquifactEscrowClient<'_>,
+    invoice_id: &Symbol,
+    investors: &[Address],
+) -> u32 {
+    let events = env.events().all();
+    investors
         .iter()
-        .filter(|event| {
-            let topic: Symbol = event
-                .topics()
-                .get(0)
-                .unwrap()
-                .try_into_val(env)
-                .unwrap();
-            topic == symbol_short!("inv_claim")
+        .map(|investor| {
+            let expected = crate::InvestorPayoutClaimed {
+                name: symbol_short!("inv_claim"),
+                investor: investor.clone(),
+                invoice_id: invoice_id.clone(),
+            }
+            .to_xdr(env, &client.address);
+            events.events().iter().filter(|e| **e == expected).count() as u32
         })
-        .count() as u32
+        .sum()
 }
 
 #[test]
@@ -101,8 +107,10 @@ fn push_pays_each_investor_and_is_idempotent() {
         ],
     );
 
+    let invoice_id = client.get_escrow().invoice_id;
     env.mock_auths(&[]);
     assert_eq!(client.push_investor_payouts(&batch), (3, expected_total));
+    assert_eq!(claim_event_count(&env, &client, &invoice_id, &investors), 3);
     for investor in &investors {
         assert!(client.is_investor_claimed(investor));
         assert_eq!(
@@ -110,10 +118,10 @@ fn push_pays_each_investor_and_is_idempotent() {
             client.compute_investor_payout(investor)
         );
     }
-    assert_eq!(claim_event_count(&env), 3);
 
+    // A second push is a no-op: nothing paid and no new claim events.
     assert_eq!(client.push_investor_payouts(&batch), (0, 0));
-    assert_eq!(claim_event_count(&env), 3);
+    assert_eq!(claim_event_count(&env, &client, &invoice_id, &investors), 0);
 }
 
 #[test]
